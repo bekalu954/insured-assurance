@@ -1,35 +1,72 @@
-name: Java CI with Maven (maven-build.yml)
+# ... (name, on, and build_and_test_app job from before) ...
 
-on:
-  push:
-    branches: [ master ] # Triggers on push to the master branch
-  pull_request:
-    branches: [ master ] # Triggers on pull requests to the master branch
-
-jobs:
-  build_and_test_app:
+  deploy_to_tomcat_via_jenkins:
+    needs: build_and_test_app
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' # Ensure this matches your default branch (master or main)
 
     steps:
-    - name: Checkout repository code
-      uses: actions/checkout@v4
-
-    - name: Set up JDK 21
-      uses: actions/setup-java@v4
+    - name: Download WAR artifact from build job
+      uses: actions/download-artifact@v4
       with:
-        java-version: '21' # Align with your project's JDK
-        distribution: 'temurin'
-        cache: 'maven'
+        name: insured-assurance-war # Matches upload name
+        path: ./downloaded-war-artifact
 
-    - name: Build with Maven
-      run: mvn -B clean package --file pom.xml # -B for batch mode, 'clean' ensures fresh build
+    - name: Find WAR file name and path
+      id: find_war
+      run: |
+        WAR_FILE_PATH=$(find ./downloaded-war-artifact -name '*.war' -type f -print -quit)
+        if [ -z "$WAR_FILE_PATH" ]; then
+          echo "::error::WAR file not found in ./downloaded-war-artifact"
+          exit 1
+        fi
+        echo "WAR_FILE_NAME=$(basename $WAR_FILE_PATH)" >> $GITHUB_OUTPUT
+        echo "FULL_WAR_PATH=$WAR_FILE_PATH" >> $GITHUB_OUTPUT
+        echo "Found WAR: $(basename $WAR_FILE_PATH) at $WAR_FILE_PATH"
 
-    - name: Run tests with Maven
-      run: mvn test --file pom.xml # This will run if you have tests and surefire plugin
-
-    - name: Upload application WAR artifact
-      uses: actions/upload-artifact@v4
+    - name: SCP WAR artifact to intermediate server
+      uses: appleboy/scp-action@master
       with:
-        name: insured-assurance-war # Artifact name for Jenkins to find
-        path: target/*.war # Path to the built WAR file
-                           # Ensure this matches your pom.xml's finalName or artifactId
+        host: ${{ secrets.SCP_HOST }}
+        username: ${{ secrets.SCP_USER }}
+        key: ${{ secrets.SCP_KEY }}
+        source: "${{ steps.find_war.outputs.FULL_WAR_PATH }}"
+        target: "${{ secrets.SCP_TARGET_PATH }}/" # Note the trailing slash for directory
+        # strip_components: 1 # May be needed if artifact is in a subdirectory like 'target' within the zip
+
+    - name: Trigger Jenkins Deployment Job (using Build Token & Crumb)
+      env:
+        JENKINS_URL: ${{ secrets.JENKINS_URL }}
+        JENKINS_USER: ${{ secrets.JENKINS_USER }}
+        JENKINS_API_TOKEN: ${{ secrets.JENKINS_API_TOKEN }}
+        JENKINS_JOB_NAME: ${{ secrets.JENKINS_JOB_NAME }}
+        JENKINS_TRIGGER_TOKEN: ${{ secrets.JENKINS_TRIGGER_TOKEN }}
+        WAR_FILE_NAME_PARAM: ${{ steps.find_war.outputs.WAR_FILE_NAME }}
+        SCP_TARGET_PATH_PARAM: "${{ secrets.SCP_TARGET_PATH }}/${{ steps.find_war.outputs.WAR_FILE_NAME }}"
+      run: |
+        echo "Attempting to trigger Jenkins job: $JENKINS_JOB_NAME"
+        echo "WAR File Name for Jenkins: $WAR_FILE_NAME_PARAM"
+        echo "SCP Path on Host for Jenkins: $SCP_TARGET_PATH_PARAM"
+
+        # Fetch CSRF Crumb if Jenkins has it enabled
+        CRUMB_ISSUER_URL="$JENKINS_URL/crumbIssuer/api/xml?xpath=concat(//crumbRequestField,\":\",//crumb)"
+        CRUMB_DATA=$(curl -s --user "$JENKINS_USER:$JENKINS_API_TOKEN" "$CRUMB_ISSUER_URL")
+        CRUMB_HEADER=""
+        if [[ "$CRUMB_DATA" == *":"* ]]; then
+          CRUMB_HEADER="-H $CRUMB_DATA"
+          echo "CSRF Crumb obtained: $CRUMB_DATA"
+        else
+          echo "CSRF Crumb not found or not enabled. Proceeding without crumb."
+        fi
+
+        TRIGGER_URL="$JENKINS_URL/job/$JENKINS_JOB_NAME/buildWithParameters"
+
+        curl -X POST "$TRIGGER_URL" \
+          $CRUMB_HEADER \
+          --user "$JENKINS_USER:$JENKINS_API_TOKEN" \
+          --data-urlencode "token=$JENKINS_TRIGGER_TOKEN" \
+          --data-urlencode "WAR_FILE_NAME=$WAR_FILE_NAME_PARAM" \
+          --data-urlencode "SCP_PATH_ON_HOST=$SCP_TARGET_PATH_PARAM" \
+          --fail --show-error
+
+        echo "Jenkins job trigger request sent."

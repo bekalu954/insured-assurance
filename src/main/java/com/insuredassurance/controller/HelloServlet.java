@@ -21,7 +21,7 @@ public class HelloServlet extends HttpServlet {
             out.println("<title>Insured Assurance - Hello</title>");
             out.println("</head>");
             out.println("<body>");
-            out.println("<h1>Hello World from Insured Assurance Servlet!</h1>");
+            out.println("<h1>Welcome to Insured Assurance App V2 - Now with CI/CD!</h1>");
             out.println("<p>Your CI/CD pipeline is ready to deploy this simple application.</p>");
             out.println("</body>");
             out.println("</html>");
